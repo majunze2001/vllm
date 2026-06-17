@@ -14,6 +14,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.kernels.mhc.tilelang import (
@@ -58,6 +59,11 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.common.uneven_block_shard import (
+    block_n_from_quant_config,
+    make_block_sharded_shared_expert_linears,
+    should_use_uneven_block_sharding,
+)
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
 )
@@ -81,27 +87,49 @@ class DeepseekV4MLP(nn.Module):
     ) -> None:
         super().__init__()
 
-        # If is_sequence_parallel, the input and output tensors are sharded
-        # across the ranks within the tp_group. In this case the weights are
-        # replicated and no collective ops are needed.
-        # Otherwise we use standard TP with an allreduce at the end.
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            disable_tp=is_sequence_parallel,
-            prefix=f"{prefix}.gate_up_proj",
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=reduce_results,
-            disable_tp=is_sequence_parallel,
-            prefix=f"{prefix}.down_proj",
-        )
+        # When block-FP8 quantized and tp_size does not divide
+        # intermediate_size / block_n (e.g. 3072 / 16 = 192, not a multiple of
+        # 128), the intermediate cannot be sharded evenly without splitting a
+        # 128-block, whose FP8 scale is shared and indivisible. Distribute whole
+        # blocks unevenly instead; the per-rank down_proj partials still sum to
+        # the full output, so we just all-reduce here (the disable_tp linears
+        # built for this path do not all-reduce themselves).
+        self._uneven_all_reduce = False
+        tp_size = get_tensor_model_parallel_world_size()
+        block_n = block_n_from_quant_config(quant_config)
+        if (
+            not is_sequence_parallel
+            and block_n is not None
+            and should_use_uneven_block_sharding(intermediate_size, tp_size, block_n)
+        ):
+            self.gate_up_proj, self.down_proj = (
+                make_block_sharded_shared_expert_linears(
+                    hidden_size, intermediate_size, quant_config, block_n, prefix
+                )
+            )
+            self._uneven_all_reduce = reduce_results
+        else:
+            # If is_sequence_parallel, the input and output tensors are sharded
+            # across the ranks within the tp_group. In this case the weights are
+            # replicated and no collective ops are needed.
+            # Otherwise we use standard TP with an allreduce at the end.
+            self.gate_up_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [intermediate_size] * 2,
+                bias=False,
+                quant_config=quant_config,
+                disable_tp=is_sequence_parallel,
+                prefix=f"{prefix}.gate_up_proj",
+            )
+            self.down_proj = RowParallelLinear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                reduce_results=reduce_results,
+                disable_tp=is_sequence_parallel,
+                prefix=f"{prefix}.down_proj",
+            )
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
@@ -115,6 +143,8 @@ class DeepseekV4MLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
+        if self._uneven_all_reduce:
+            x = tensor_model_parallel_all_reduce(x)
         return x
 
 
